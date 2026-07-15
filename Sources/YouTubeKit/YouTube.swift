@@ -25,6 +25,19 @@ public class YouTube {
     private static var __iframePlayerURL: URL?
     private static var __iframePlayerURLFetchedAt: Date?
 #endif
+#if swift(>=5.10)
+    nonisolated(unsafe) private static var __ytcfg: Extraction.YtCfg?
+    nonisolated(unsafe) private static var __ytcfgFetchedAt: Date?
+#else
+    private static var __ytcfg: Extraction.YtCfg?
+    private static var __ytcfgFetchedAt: Date?
+#endif
+    private static let ytcfgLock = NSLock()
+    /// ytcfg holds session-scoped values (visitorData, userAgent) — NOT per-video ones —
+    /// so it can be fetched once and reused instead of costing a ~610 KB watch-page
+    /// download per track.
+    private static let ytcfgTTL: TimeInterval = 60 * 60
+
     private static let iframePlayerURLLock = NSLock()
     /// base.js is swapped roughly weekly; an hour is well inside that and any staleness
     /// is self-healing (a stale player fails the solve, which clears the JS cache and retries).
@@ -305,8 +318,22 @@ public class YouTube {
                 return cached
             }
             
-            _ytcfg = try await Extraction.extractYtCfg(from: watchHTML)
-            return _ytcfg!
+            Self.ytcfgLock.lock()
+            let shared = Self.__ytcfg
+            let sharedAt = Self.__ytcfgFetchedAt
+            Self.ytcfgLock.unlock()
+            if let shared, let sharedAt, Date().timeIntervalSince(sharedAt) < Self.ytcfgTTL {
+                _ytcfg = shared
+                return shared
+            }
+
+            let fetched = try await Extraction.extractYtCfg(from: watchHTML)
+            Self.ytcfgLock.lock()
+            Self.__ytcfg = fetched
+            Self.__ytcfgFetchedAt = Date()
+            Self.ytcfgLock.unlock()
+            _ytcfg = fetched
+            return fetched
         }
     }
     
