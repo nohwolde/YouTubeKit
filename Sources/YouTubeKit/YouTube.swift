@@ -17,10 +17,18 @@ public class YouTube {
 #if swift(>=5.10)
     nonisolated(unsafe) private static var __js: String? // caches js between calls
     nonisolated(unsafe) private static var __jsURL: URL?
+    nonisolated(unsafe) private static var __iframePlayerURL: URL?
+    nonisolated(unsafe) private static var __iframePlayerURLFetchedAt: Date?
 #else
     private static var __js: String? // caches js between calls
     private static var __jsURL: URL?
+    private static var __iframePlayerURL: URL?
+    private static var __iframePlayerURLFetchedAt: Date?
 #endif
+    private static let iframePlayerURLLock = NSLock()
+    /// base.js is swapped roughly weekly; an hour is well inside that and any staleness
+    /// is self-healing (a stale player fails the solve, which clears the JS cache and retries).
+    private static let iframePlayerURLTTL: TimeInterval = 60 * 60
     
     private var _videoInfos: [InnerTube.VideoInfo]?
     
@@ -128,9 +136,39 @@ public class YouTube {
     }
     
     
+    /// Playability as reported by InnerTube (`/player`), mapped onto the same shape the
+    /// watch-page extractor returns. `nil` means InnerTube told us nothing useful and the
+    /// caller should fall back.
+    private func innerTubePlayabilityStatus() async throws -> (Extraction.InitialPlayerResponse.PlayabilityStatus.Status?, [String?])? {
+        guard let infos = try? await videoInfos else { return nil }
+        // Any client reporting OK means it's playable; only report a problem if we have one.
+        let statuses = infos.compactMap { $0.playabilityStatus }
+        guard !statuses.isEmpty else { return nil }
+        if statuses.contains(where: { $0.status?.uppercased() == "OK" }) {
+            return (.ok, [nil])
+        }
+        guard let first = statuses.first,
+              let raw = first.status?.uppercased(),
+              let mapped = Extraction.InitialPlayerResponse.PlayabilityStatus.Status(rawValue: raw) else {
+            return nil
+        }
+        return (mapped, [first.reason])
+    }
+
     /// check whether the video is available
     public func checkAvailability() async throws {
-        let (status, messages) = try Extraction.playabilityStatus(watchHTML: await watchHTML)
+        // Prefer InnerTube's playabilityStatus over the watch page. It is the same
+        // information from the same source YouTube's own clients use, and we fetch the
+        // /player response anyway — whereas parsing it out of the watch page costs a
+        // ~610 KB download PER TRACK (the dominant cost of a resolve on a phone).
+        // Falls back to the watch page if InnerTube gives us nothing to judge by.
+        let status: Extraction.InitialPlayerResponse.PlayabilityStatus.Status?
+        let messages: [String?]
+        if let fromInnerTube = try await innerTubePlayabilityStatus() {
+            (status, messages) = fromInnerTube
+        } else {
+            (status, messages) = try Extraction.playabilityStatus(watchHTML: await watchHTML)
+        }
 
         for reason in messages {
             switch status {
@@ -172,7 +210,18 @@ public class YouTube {
             if let cached = _jsURL {
                 return cached
             }
-            
+
+            // base.js is a SITE-WIDE asset, not per-video, so its URL can be found once
+            // and reused for every video. `/iframe_api` publishes the current player id in
+            // ~1 KB; deriving it from the watch page instead costs a ~610 KB download PER
+            // TRACK (measured on an iPhone 15 over cellular: ~1100-2000 ms per track vs
+            // ~47 ms for /iframe_api). That download dominated resolve time.
+            if let fast = try? await Self.playerURLFromIframeAPI() {
+                _jsURL = fast
+                return fast
+            }
+
+            // Fallback: the original watch/embed-page derivation.
             if try await ageRestricted {
                 _jsURL = try await URL(string: Extraction.jsURL(html: embedHTML))!
             } else {
@@ -180,6 +229,43 @@ public class YouTube {
             }
             return _jsURL!
         }
+    }
+
+    /// Current player JS URL, from `/iframe_api`. Cached process-wide (the player is
+    /// site-wide, not per-video) with a short TTL.
+    private static func playerURLFromIframeAPI() async throws -> URL {
+        iframePlayerURLLock.lock()
+        let cached = __iframePlayerURL
+        let fetchedAt = __iframePlayerURLFetchedAt
+        iframePlayerURLLock.unlock()
+        if let cached, let fetchedAt, Date().timeIntervalSince(fetchedAt) < iframePlayerURLTTL {
+            return cached
+        }
+
+        var request = URLRequest(url: URL(string: "https://www.youtube.com/iframe_api")!)
+        request.setValue("Mozilla/5.0", forHTTPHeaderField: "User-Agent")
+        request.httpShouldHandleCookies = false
+        let (data, _) = try await URLSession.shared.data(for: request)
+        guard let js = String(data: data, encoding: .utf8) else {
+            throw YouTubeKitError.extractError
+        }
+        // The body embeds the id as an escaped path: ...\/s\/player\/<id>\/www-widgetapi...
+        guard let idRange = js.range(of: #"player\/[a-zA-Z0-9_-]+\/"#, options: .regularExpression) else {
+            throw YouTubeKitError.regexMatchError
+        }
+        let playerID = js[idRange]
+            .replacingOccurrences(of: #"player\/"#, with: "")
+            .replacingOccurrences(of: #"\/"#, with: "")
+        guard !playerID.isEmpty,
+              let url = URL(string: "https://www.youtube.com/s/player/\(playerID)/player_ias.vflset/en_US/base.js") else {
+            throw YouTubeKitError.extractError
+        }
+
+        iframePlayerURLLock.lock()
+        __iframePlayerURL = url
+        __iframePlayerURLFetchedAt = Date()
+        iframePlayerURLLock.unlock()
+        return url
     }
     
     var js: String {
